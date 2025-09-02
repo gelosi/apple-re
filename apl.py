@@ -1,28 +1,7 @@
 #!/usr/bin/env python3
 """
-apple_refurbs_playwright.py
-
 Playwright-based crawler for Apple refurbished storefronts (country-by-country).
-
-- Renders pages (handles client-side JS)
-- Attempts to paginate / click "Load more" where available
-- Discovers product links heuristically
-- Parses product pages using JSON-LD first, falling back to meta tags / inline JS / visible text
-- Verbose mode prints parsed product objects during run
-- Output JSON groups products by country and includes original product URL ("source_url")
-
-Prereqs:
-  pip install playwright bs4
-  playwright install   # installs browsers
-
-Usage:
-  python apple_refurbs_playwright.py                 # uses builtin country -> start map
-  python apple_refurbs_playwright.py --countries DE,FR,US --verbose --output out.json
-  python apple_refurbs_playwright.py --start-urls urls.txt --max-per-country 200
-
-Notes:
- - Respect robots.txt and Apple terms. Use responsibly.
- - If Apple changes their storefront greatly, selectors/heuristics may need tweaks.
+Updated: validate candidate links and only emit parsed objects for real product pages.
 """
 
 import asyncio
@@ -51,6 +30,8 @@ DEFAULT_COUNTRY_START_URLS = {
     "IT": "https://www.apple.com/it/shop/refurbished",
     "NL": "https://www.apple.com/nl/shop/refurbished",
     "SE": "https://www.apple.com/se/shop/refurbished",
+    "IE": "https://www.apple.com/ie/shop/refurbished",
+    "CH-DE": "https://www.apple.com/ch-de/shop/refurbished",
 }
 
 # ---------- Config ----------
@@ -137,7 +118,6 @@ def extract_price_from_product(prod):
 def extract_details_text(html):
     soup = BeautifulSoup(html, "lxml")
     texts = []
-    # common Apple product description containers (heuristic)
     selectors = [
         ".as-productinfo", ".product-hero", ".tech-specs", ".rb-content", ".product-hero__description",
         ".section-copy", "#overview", ".description"
@@ -177,8 +157,12 @@ def find_ram_storage_chip(text):
 
 # ---------- Product parsing ----------
 def parse_product_page_html(html, source_url=None):
+    """
+    Returns parsed dict plus an 'is_product' boolean.
+    is_product == True if a Product JSON-LD block exists OR price/offer info present.
+    """
     blocks = extract_ld_json(html)
-    prod = find_product_block(blocks)
+    prod_block = find_product_block(blocks)
     title = None
     price = None
     currency = None
@@ -186,36 +170,56 @@ def parse_product_page_html(html, source_url=None):
     description = None
     additional_details = extract_details_text(html)
 
-    if prod:
-        title = prod.get('name') or prod.get('headline')
-        price, currency = extract_price_from_product(prod)
-        image = prod.get('image')
+    if prod_block:
+        # Primary source: JSON-LD Product
+        title = prod_block.get('name') or prod_block.get('headline')
+        price, currency = extract_price_from_product(prod_block)
+        image = prod_block.get('image')
         if isinstance(image, list):
             image = image[0]
         if not image:
             image = find_first_image_from_imagegallery(blocks) or meta_tag(html, prop='og:image')
-        description = prod.get('description') or meta_tag(html, prop='og:description') or meta_tag(html, name='description')
+        description = prod_block.get('description') or meta_tag(html, prop='og:description') or meta_tag(html, name='description')
     else:
+        # fallback extraction
         title = meta_tag(html, prop='og:title') or meta_tag(html, name='title') or source_url
         image = meta_tag(html, prop='og:image')
         description = meta_tag(html, prop='og:description') or meta_tag(html, name='description')
+        # try to find price in inline JS / structured data
         mprice = re.search(r'"priceCurrency"\s*:\s*["\']([A-Z]{3})["\'].*?"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
                            html, flags=re.IGNORECASE | re.DOTALL)
         if mprice:
             currency = mprice.group(1)
-            price = float(mprice.group(2))
+            try:
+                price = float(mprice.group(2))
+            except:
+                price = mprice.group(2)
         else:
             mcur = re.search(r'"currentPrice"\s*:\s*\{[^}]*"raw_amount"\s*:\s*["\']([0-9\.]+)["\']', html)
             if mcur:
                 try:
                     price = float(mcur.group(1))
-                except Exception:
+                except:
                     price = mcur.group(1)
 
     longtext = (description or '') + "\n" + additional_details
     specs = find_ram_storage_chip(longtext)
 
-    return {
+    # Decide if this page is a product: product JSON-LD OR presence of price or an og:image and some specs
+    is_product = False
+    if prod_block:
+        is_product = True
+    elif price is not None:
+        is_product = True
+    elif image and (specs['storage'] or specs['chip'] or specs['ram']):
+        is_product = True
+    else:
+        # check og:type product
+        og_type = meta_tag(html, prop='og:type')
+        if og_type and 'product' in og_type.lower():
+            is_product = True
+
+    parsed = {
         "title": (title.strip() if title else None),
         "price": price,
         "currency": currency,
@@ -224,27 +228,21 @@ def parse_product_page_html(html, source_url=None):
         "chip": specs['chip'],
         "additional_details": additional_details,
         "image": image,
-        "source_url": source_url
+        "source_url": source_url,
+        "is_product": is_product
     }
+    return parsed
 
 
 # ---------- Page utilities (discover links, paginate) ----------
 async def try_expand_listing(page):
-    """
-    Attempt to paginate / reveal more products for a listing page by:
-    - Clicking buttons with likely text ("Load more", "Show more", "Mehr laden", etc.)
-    - Scrolling to bottom and waiting
-    Returns True if it clicked something at least once.
-    """
     clicked_any = False
     more_text_patterns = [
         r'load more', r'show more', r'mehr', r'more results', r'anzeigen', r'voir plus', r'voir plus de',
-        r'carica altro', r'cargar más', r'cargar mas', r'zeige mehr', r'voir plus', r'view more'
+        r'carica altro', r'cargar más', r'cargar mas', r'zeige mehr', r'view more'
     ]
     try:
-        # try a few rounds
         for _ in range(6):
-            # try to find a button with matching accessible name/text
             btn = await page.query_selector("button:has-text('Load more'), button:has-text('Show more'), button:has-text('Mehr')")
             if btn:
                 try:
@@ -255,8 +253,6 @@ async def try_expand_listing(page):
                     continue
                 except Exception:
                     pass
-
-            # fallback: search all buttons and match text
             buttons = await page.query_selector_all("button")
             found = False
             for b in buttons:
@@ -275,10 +271,8 @@ async def try_expand_listing(page):
                 except Exception:
                     continue
             if not found:
-                # try infinite scroll: scroll to bottom and wait a bit
                 await page.evaluate("() => window.scrollBy(0, document.body.scrollHeight)")
                 await asyncio.sleep(0.8)
-                # break if no load more button found
                 break
     except PlaywrightTimeoutError:
         pass
@@ -288,9 +282,7 @@ async def try_expand_listing(page):
 
 
 async def discover_product_links_on_page(page, base_url):
-    """Return a set of candidate product URLs discovered on given page"""
     urls = set()
-    # 1) Extract all anchor hrefs
     anchors = await page.query_selector_all("a[href]")
     for a in anchors:
         try:
@@ -304,7 +296,6 @@ async def discover_product_links_on_page(page, base_url):
         except Exception:
             continue
 
-    # 2) Check for JSON-LD containing candidate URLs
     content = await page.content()
     blocks = extract_ld_json(content)
     for b in blocks:
@@ -313,30 +304,43 @@ async def discover_product_links_on_page(page, base_url):
             if isinstance(url, str):
                 urls.add(url)
 
-    # filter heuristics for product pages
-    product_patterns = re.compile(r'/shop/(product|refurbished|buy)|\brefurb\b|\breconditionn|\breacondicion|/product/|/product-page', re.IGNORECASE)
+    # Narrow heuristics: keep many, but validation will filter the real products.
+    product_patterns = re.compile(r'/shop/product/|/product/|/product-page|/A/|refurbished.*product', re.IGNORECASE)
     filtered = {u for u in urls if product_patterns.search(u)}
     return filtered
 
 
-# ---------- Orchestrator ----------
-async def fetch_product_and_parse(semaphore: Semaphore, browser, url, verbose=False):
+# ---------- Orchestrator: validate & parse (single fetch per candidate) ----------
+async def fetch_and_validate_parse(semaphore: Semaphore, browser, url, verbose=False):
+    """
+    Fetch candidate URL, parse HTML and validate whether it's a product.
+    Return parsed dict if product, else None.
+    """
     async with semaphore:
+        context = await browser.new_context(user_agent="Mozilla/5.0 (compatible; RefurbCrawler/1.0)")
+        page = await context.new_page()
         try:
-            context = await browser.new_context(user_agent="Mozilla/5.0 (compatible; RefurbCrawler/1.0)")
-            page = await context.new_page()
             await page.goto(url, timeout=PRODUCT_PAGE_TIMEOUT)
             await asyncio.sleep(random.uniform(*RANDOM_DELAY))
             html = await page.content()
             parsed = parse_product_page_html(html, source_url=url)
-            if verbose:
-                print(json.dumps(parsed, ensure_ascii=False))
-            await page.close()
-            await context.close()
-            return parsed
+            if parsed and parsed.get("is_product"):
+                # drop is_product flag from final output (not needed)
+                parsed.pop("is_product", None)
+                if verbose:
+                    print(json.dumps(parsed, ensure_ascii=False))
+                await page.close()
+                await context.close()
+                return parsed
+            else:
+                if verbose:
+                    print(f"  - skipping non-product: {url}")
+                await page.close()
+                await context.close()
+                return None
         except Exception as e:
             if verbose:
-                print("  ! failed product:", url, ":", str(e))
+                print("  ! failed validating", url, ":", str(e))
             try:
                 await page.close()
             except Exception:
@@ -362,35 +366,33 @@ async def crawl_country_playwright(country_tag, start_url, browser, max_per_coun
             pass
         return []
 
-    # attempt to expand listing (click load more)
     await try_expand_listing(page)
 
-    # after expansion/scrolling, collect candidate links
     candidates = await discover_product_links_on_page(page, start_url)
     if verbose:
-        print(f"  -> discovered {len(candidates)} candidate links")
+        print(f"  -> discovered {len(candidates)} candidate links (pre-filtered)")
 
-    # limit
+    # limit and dedupe
+    candidates = list(dict.fromkeys(candidates))
     if max_per_country and max_per_country > 0:
-        candidates = list(candidates)[:max_per_country]
-    else:
-        candidates = list(candidates)
+        candidates = candidates[:max_per_country]
 
-    # fetch each product concurrently (bounded)
+    # validate & parse concurrently with semaphore
     sem = Semaphore(CONCURRENT_PRODUCT_FETCHES)
-    tasks = [asyncio.create_task(fetch_product_and_parse(sem, browser, u, verbose=verbose)) for u in candidates]
+    tasks = [asyncio.create_task(fetch_and_validate_parse(sem, browser, u, verbose=verbose)) for u in candidates]
     results = []
     for t in asyncio.as_completed(tasks):
         parsed = await t
         if parsed:
             results.append(parsed)
+
     await page.close()
     print(f"[+] {country_tag}: parsed {len(results)} products")
     return results
 
 
+# ---------- CLI & main ----------
 async def main_async(args):
-    # build start map
     if args.start_urls:
         start_map = {}
         with open(args.start_urls, "r", encoding="utf-8") as fh:
@@ -422,15 +424,12 @@ async def main_async(args):
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=not args.show_browser)
-        browser_ctx = browser  # pass browser around
         out = {}
         for tag, url in start_map.items():
-            prods = await crawl_country_playwright(tag, url, browser_ctx, max_per_country=args.max_per_country, verbose=args.verbose)
+            prods = await crawl_country_playwright(tag, url, browser, max_per_country=args.max_per_country, verbose=args.verbose)
             out[tag] = prods
-            # politeness
             time.sleep(random.uniform(*RANDOM_DELAY))
 
-        # write output
         out_path = Path(args.output)
         out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         print("Saved:", out_path.resolve())
