@@ -3,12 +3,10 @@
 apple_refurbs_playwright.py
 
 Playwright crawler for Apple refurbished storefronts.
-- BFS over categories (mac/ipad/iphone/watch/accessories...)
-- Strict product-url heuristics so source_url is a concrete product page
-- Verbose prints parsed products live
-
-Usage:
-  python apple_refurbs_playwright.py --countries FR,DE --verbose --max-per-country 300 --max-pages 200
+Avoids false positives by only accepting concrete product pages.
+- BFS across category pages (seeded from /shop/refurbished)
+- Accepts a product only if URL is strongly product-like or canonical indicates product
+- source_url in output is the concrete product URL (canonical if present)
 """
 
 import asyncio
@@ -80,6 +78,20 @@ def meta_tag(html, name=None, prop=None):
                       html, flags=re.IGNORECASE)
         if m:
             return unescape(m.group(1).strip())
+    return None
+
+
+def get_canonical(html):
+    # try og:url, then link rel=canonical, then <meta itemprop="url">
+    og = meta_tag(html, prop='og:url')
+    if og:
+        return og.split('#')[0].rstrip('/')
+    m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]*href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).split('#')[0].rstrip('/')
+    item = re.search(r'<meta[^>]+itemprop=["\']url["\'][^>]*content=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    if item:
+        return item.group(1).split('#')[0].rstrip('/')
     return None
 
 
@@ -163,6 +175,9 @@ def find_ram_storage_chip(text):
 
 
 def parse_product_page_html(html, source_url=None):
+    """
+    Parse fields and return dict including 'is_product' boolean.
+    """
     blocks = extract_ld_json(html)
     prod_block = find_product_block(blocks)
     title = None
@@ -204,6 +219,7 @@ def parse_product_page_html(html, source_url=None):
     longtext = (description or '') + "\n" + additional_details
     specs = find_ram_storage_chip(longtext)
 
+    # decide product-ness conservatively: prefer JSON-LD product OR price+image+some spec
     is_product = False
     if prod_block:
         is_product = True
@@ -234,16 +250,14 @@ def parse_product_page_html(html, source_url=None):
 # ---------- Link discovery & heuristics ----------
 def looks_like_product_url(url: str) -> bool:
     """
-    Stronger product URL heuristics:
-    - canonical pattern: /shop/product/
-    - fallback patterns: /product/ or /A/<ID segment> (Apple product IDs)
-    - some refurbished product anchors live under /shop/refurbished/... but contain product IDs or fnode query;
-      accept conservatively only when those patterns present.
+    Strong product URL heuristics: canonical /shop/product/ or product-id segments.
+    Conservative to avoid false positives.
     """
     if re.search(r'/shop/product/', url, flags=re.IGNORECASE):
         return True
     if re.search(r'/product/|/product-page|/A/[A-Z0-9]{5,}', url, flags=re.IGNORECASE):
         return True
+    # Accept refurbished links that embed an uppercase product token or fnode param conservatively
     if '/shop/refurbished/' in url and ('?fnode=' in url or re.search(r'/[A-Z0-9]{6,}', url)):
         return True
     return False
@@ -251,8 +265,7 @@ def looks_like_product_url(url: str) -> bool:
 
 async def discover_links_on_page(page, base_url):
     """
-    Return same-origin links on the page (normalized, fragments removed).
-    Caller will split into product-like vs category-like.
+    Return same-origin normalized links found on the page.
     """
     urls = set()
     anchors = await page.query_selector_all("a[href]")
@@ -262,15 +275,13 @@ async def discover_links_on_page(page, base_url):
             if not href or href.startswith("javascript:") or href.startswith("#"):
                 continue
             full = urljoin(base_url, href)
-            parsed_base = urlparse(base_url)
-            parsed_full = urlparse(full)
-            if parsed_base.netloc != parsed_full.netloc:
+            # same host only
+            if urlparse(full).netloc != urlparse(base_url).netloc:
                 continue
             urls.add(full.split('#')[0].rstrip('/'))
         except Exception:
             continue
 
-    # JSON-LD fallback
     content = await page.content()
     blocks = extract_ld_json(content)
     for b in blocks:
@@ -282,11 +293,11 @@ async def discover_links_on_page(page, base_url):
     return urls
 
 
-# ---------- Validate & parse ----------
+# ---------- Validate & parse (single fetch) ----------
 async def fetch_and_validate_parse(semaphore: Semaphore, browser, url: str, verbose=False):
     """
-    Fetch the candidate URL and parse/validate productness in a single fetch.
-    Return parsed dict (with source_url) if product, else None.
+    Fetch the candidate URL, parse and validate it.
+    Ensures source_url is canonical if provided and canonical looks product-like.
     """
     async with semaphore:
         context = await browser.new_context(user_agent="Mozilla/5.0 (compatible; RefurbCrawler/1.0)")
@@ -295,9 +306,19 @@ async def fetch_and_validate_parse(semaphore: Semaphore, browser, url: str, verb
             await page.goto(url, timeout=PRODUCT_PAGE_TIMEOUT)
             await asyncio.sleep(random.uniform(*RANDOM_DELAY))
             html = await page.content()
-            parsed = parse_product_page_html(html, source_url=url)
+            canonical = get_canonical(html)
+            # choose validation URL: prefer canonical if it's product-like
+            validate_url = url
+            if canonical and looks_like_product_url(canonical):
+                validate_url = canonical
+            parsed = parse_product_page_html(html, source_url=validate_url)
             if parsed and parsed.get("is_product"):
                 parsed.pop("is_product", None)
+                # if canonical exists and looks product-like, set source_url to canonical
+                if canonical and looks_like_product_url(canonical):
+                    parsed['source_url'] = canonical
+                else:
+                    parsed['source_url'] = url
                 if verbose:
                     print(json.dumps(parsed, ensure_ascii=False))
                 await page.close()
@@ -305,7 +326,7 @@ async def fetch_and_validate_parse(semaphore: Semaphore, browser, url: str, verb
                 return parsed
             else:
                 if verbose:
-                    print(f"  - skipping non-product: {url}")
+                    print(f"  - skipping non-product: {url} (canonical: {canonical})")
                 await page.close()
                 await context.close()
                 return None
@@ -384,16 +405,14 @@ async def crawl_country_bfs(country_tag, start_url, browser, max_per_country=0, 
             pass
         return []
 
-    # expand the start page to reveal category links
+    # expand and seed only category links under /shop/refurbished/
     await try_expand_listing(page)
     initial_links = await discover_links_on_page(page, start_url)
     await page.close()
 
-    # seed only refurbished category links (avoid seeding everything)
     category_links = [u for u in initial_links
                       if '/shop/refurbished/' in u and u.rstrip('/') != start_url.rstrip('/')]
     if not category_links:
-        # fallback: if we found no explicit category link, include start page itself
         queue = [(start_url.rstrip('/'), 1)]
     else:
         queue = [(u.rstrip('/'), 1) for u in category_links]
@@ -413,16 +432,9 @@ async def crawl_country_bfs(country_tag, start_url, browser, max_per_country=0, 
             continue
         visited.add(url)
 
-        # keep same host
         if urlparse(url).netloc != urlparse(start_url).netloc:
             continue
 
-        # avoid re-visiting start root
-        if url.rstrip('/') == start_url.rstrip('/'):
-            # still process once if it was our only seed
-            pass
-
-        # open page
         try:
             page = await browser.new_page()
             await page.goto(url, timeout=PAGE_TIMEOUT)
@@ -430,18 +442,35 @@ async def crawl_country_bfs(country_tag, start_url, browser, max_per_country=0, 
             pages_visited += 1
             html = await page.content()
 
-            # check quick heuristics for product
-            blocks = extract_ld_json(html)
-            prod_block = find_product_block(blocks)
+            # canonical and quick checks
+            canonical = get_canonical(html)
+            prod_block = find_product_block(extract_ld_json(html))
             og_type = meta_tag(html, prop='og:type') or ""
-            maybe_product_url = looks_like_product_url(url)
 
-            if prod_block or 'product' in og_type.lower() or maybe_product_url:
-                # schedule validation and parsing (single fetch inside function)
-                task = asyncio.create_task(fetch_and_validate_parse(sem, browser, url, verbose=verbose))
-                product_tasks.append(task)
+            url_is_product_like = looks_like_product_url(url)
+            canonical_is_product_like = bool(canonical and looks_like_product_url(canonical))
+
+            # Only treat this visited URL as a candidate product if the URL (or canonical) is product-like.
+            if url_is_product_like or canonical_is_product_like:
+                # We have the page HTML already — parse it immediately to avoid double-fetch.
+                validate_source = canonical if canonical_is_product_like else url
+                parsed = parse_product_page_html(html, source_url=validate_source)
+                if parsed.get("is_product"):
+                    parsed.pop("is_product", None)
+                    # prefer canonical as source_url when it looks product-like
+                    if canonical_is_product_like:
+                        parsed['source_url'] = canonical
+                    else:
+                        parsed['source_url'] = url
+                    results.append(parsed)
+                    if verbose:
+                        print(json.dumps(parsed, ensure_ascii=False))
+                else:
+                    if verbose:
+                        print(f"  - page looked product-like by URL but parsed as non-product: {url} (canonical: {canonical})")
+                await page.close()
             else:
-                # treat as category/listing — expand and discover inner links
+                # Category/listing page: expand then discover inner links
                 await try_expand_listing(page)
                 inner_links = await discover_links_on_page(page, url)
 
@@ -449,10 +478,13 @@ async def crawl_country_bfs(country_tag, start_url, browser, max_per_country=0, 
                 product_like = [u for u in inner_links if looks_like_product_url(u)]
                 category_like = [u for u in inner_links if '/shop/refurbished/' in u and not looks_like_product_url(u)]
 
-                # prioritize product links
+                # prioritize product links (schedule fetch+validate)
                 for pl in product_like:
                     if pl not in visited:
-                        queue.insert(0, (pl, depth))  # immediate
+                        # schedule concurrent validation-only fetch for pl
+                        task = asyncio.create_task(fetch_and_validate_parse(sem, browser, pl, verbose=verbose))
+                        product_tasks.append(task)
+
                 # enqueue subcategories (increase depth)
                 if depth < MAX_BFS_DEPTH:
                     for cl in category_like:
@@ -460,8 +492,8 @@ async def crawl_country_bfs(country_tag, start_url, browser, max_per_country=0, 
                             queue.append((cl, depth + 1))
 
                 if verbose:
-                    print(f"  [BFS] visited {url} depth={depth} -> links={len(inner_links)} products={len(product_like)} categories={len(category_like)}")
-            await page.close()
+                    print(f"  [BFS] visited {url} depth={depth} -> links={len(inner_links)} product_like={len(product_like)} category_like={len(category_like)}")
+                await page.close()
         except Exception as e:
             if verbose:
                 print(f"  ! failed visiting {url}: {e}")
@@ -471,7 +503,7 @@ async def crawl_country_bfs(country_tag, start_url, browser, max_per_country=0, 
                 pass
             continue
 
-        # harvest completed product tasks (non-blocking)
+        # harvest any finished product tasks quickly
         if product_tasks:
             done, pending = await asyncio.wait(product_tasks, timeout=0, return_when=asyncio.ALL_COMPLETED)
             product_tasks = list(pending)
@@ -485,9 +517,9 @@ async def crawl_country_bfs(country_tag, start_url, browser, max_per_country=0, 
                 except Exception:
                     pass
 
-    # finish pending product tasks
+    # finish any remaining product tasks
     if product_tasks and len(results) < max_products_cap:
-        done, pending = await asyncio.wait(product_tasks, return_when=asyncio.ALL_COMPLETED)
+        done, _ = await asyncio.wait(product_tasks, return_when=asyncio.ALL_COMPLETED)
         for d in done:
             try:
                 parsed = d.result()
