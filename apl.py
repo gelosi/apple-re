@@ -152,26 +152,50 @@ def extract_details_text(html):
     return "\n".join(texts).strip()
 
 
-def find_ram_storage_chip(text):
+def find_ram_storage_chip(text: str):
+    """
+    Detect RAM, storage, and chip name from multilingual product descriptions.
+    Supports EN, FR, DE, ES, IT.
+    """
     res = {'ram': None, 'storage': None, 'chip': None}
     if not text:
         return res
-    t = text.replace('\xa0', ' ').replace('Go', 'GB')
-    sizes = re.findall(r'(\d{1,4}\s?(?:GB|TB))', t, flags=re.IGNORECASE)
-    if sizes:
-        res['storage'] = sizes[0].upper().replace(' ', '')
-        if len(sizes) > 1:
-            res['ram'] = sizes[1].upper().replace(' ', '')
-    chip_m = re.search(r'(A\d+\s*Bionic|S\d+\s*SiP|M\d+(?:\s*(?:Pro|Max|Ultra))?|Apple\s+M\d+|P\d+|A\d+ Bionic)',
-                       t, flags=re.IGNORECASE)
-    if chip_m:
-        res['chip'] = chip_m.group(1).strip()
-    else:
-        chip2 = re.search(r'Puce\s*[:\-]?\s*([A-Za-z0-9\s\-]+)|chip\s*[:\-]?\s*([A-Za-z0-9\s\-]+)',
-                          t, flags=re.IGNORECASE)
-        if chip2:
-            res['chip'] = (chip2.group(1) or chip2.group(2) or "").strip()
+
+    t = text.replace('\xa0', ' ').replace('Go', 'GB')  # normalize NBSP + French Go
+
+    # ----- Keyword dictionaries -----
+    ram_keywords = r'(RAM|Arbeitsspeicher|mémoire|memoria|memory)'
+    storage_keywords = r'(SSD|storage|stockage|Speicher|archiviazione|almacenamiento|drive)'
+
+    # ----- RAM -----
+    ram_match = re.search(r'(\d{1,4}\s?(?:GB|TB)).{0,20}' + ram_keywords, t, flags=re.IGNORECASE)
+    if ram_match:
+        res['ram'] = ram_match.group(1).upper().replace(' ', '')
+
+    # ----- Storage -----
+    storage_match = re.search(r'(\d{1,4}\s?(?:GB|TB)).{0,20}' + storage_keywords, t, flags=re.IGNORECASE)
+    if storage_match:
+        res['storage'] = storage_match.group(1).upper().replace(' ', '')
+
+    # ----- Fallback: assign by order if only plain sizes -----
+    if not res['ram'] or not res['storage']:
+        sizes = re.findall(r'(\d{1,4}\s?(?:GB|TB))', t, flags=re.IGNORECASE)
+        if sizes:
+            if not res['ram']:
+                res['ram'] = sizes[0].upper().replace(' ', '')
+            if not res['storage'] and len(sizes) >= 2:
+                res['storage'] = sizes[1].upper().replace(' ', '')
+
+    # ----- Chip detection -----
+    chip_match = re.search(
+        r'(A\d+\s*Bionic|S\d+\s*SiP|Apple\s+M\d+\s*Chip?|M\d+(?:\s*(?:Pro|Max|Ultra))?)',
+        t, flags=re.IGNORECASE
+    )
+    if chip_match:
+        res['chip'] = chip_match.group(1).strip()
+
     return res
+
 
 
 def parse_product_page_html(html, source_url=None):
