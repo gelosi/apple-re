@@ -1,0 +1,247 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Refurbished Apple — Viewer</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#ffffff; --muted:#6b7280; --accent:#0070c9;
+    --radius:12px; --gap:14px; --pad:14px; font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  }
+  html,body{height:100%; margin:0; background:var(--bg); color:#111827;}
+  .wrap{max-width:1200px; margin:24px auto; padding:18px;}
+  header{display:flex; gap:12px; align-items:center; margin-bottom:18px; flex-wrap:wrap;}
+  .logo{font-weight:700; font-size:20px;}
+  .controls{display:flex; gap:8px; align-items:center; flex:1; min-width:220px;}
+  input[type="search"], select{padding:10px 12px; border-radius:10px; border:1px solid #e5e7eb; background:white; font-size:14px;}
+  .filters{display:flex; gap:8px; align-items:center; flex-wrap:wrap;}
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:14px; margin-top:16px;}
+  .card{background:var(--card); border-radius:var(--radius); padding:12px; box-shadow:0 1px 2px rgba(0,0,0,0.03); display:flex; flex-direction:column; gap:8px; min-height:220px;}
+  .thumb{height:160px; border-radius:8px; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#f3f4f6;}
+  .thumb img{max-width:100%; max-height:100%; object-fit:contain; display:block;}
+  .title{font-size:14px; font-weight:600; line-height:1.2;}
+  .meta{font-size:13px; color:var(--muted);}
+  .price{color:var(--accent); font-weight:700;}
+  a.source{font-size:13px; color:var(--accent); text-decoration:none;}
+  .left-meta{display:flex; gap:8px; align-items:center; flex-wrap:wrap;}
+  .uploader{border:1px dashed #d1d5db; padding:12px; border-radius:10px; background:linear-gradient(180deg,#fff, #fbfdff);}
+  .small{font-size:13px; color:var(--muted);}
+  .toolbar{display:flex; gap:8px; align-items:center;}
+  .hidden{display:none;}
+  .noitems{padding:28px; text-align:center; color:var(--muted);}
+  footer{margin-top:20px; font-size:13px; color:var(--muted);}
+  @media (max-width:640px){ .thumb{height:120px} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">Refurbs Viewer</div>
+    <div class="controls">
+      <select id="countrySelect" title="Choose country"></select>
+      <input id="search" type="search" placeholder="Search title, chip, ram, storage..." />
+      <div class="toolbar">
+        <select id="chipFilter"><option value="">Chip (any)</option></select>
+        <select id="ramFilter"><option value="">RAM (any)</option></select>
+        <select id="sortBy"><option value="relevance">Sort: relevance</option><option value="price_asc">Price ↑</option><option value="price_desc">Price ↓</option><option value="title">Title</option></select>
+      </div>
+    </div>
+    <div class="uploader small" id="uploader" style="display:none">
+      <div><strong>Local JSON load</strong> — select the `refurbs_by_country_playwright.json` file if automatic load failed.</div>
+      <input type="file" id="fileInput" accept=".json" />
+    </div>
+  </header>
+
+  <main>
+    <div id="message" class="small"></div>
+    <div class="grid" id="grid"></div>
+    <div id="noItems" class="noitems hidden">No items match your filters.</div>
+  </main>
+
+  <footer>
+    Tips: If you're opening this file with the file:// URL and nothing loads, your browser blocks direct fetch of local files. Either run a local HTTP server (open a terminal in the folder and run <code>python -m http.server</code>) and visit <code>http://localhost:8000</code>, or use the "Local JSON load" to choose the JSON file manually.
+  </footer>
+</div>
+
+<script>
+(function(){
+  const GRID = document.getElementById('grid');
+  const countrySelect = document.getElementById('countrySelect');
+  const searchInput = document.getElementById('search');
+  const chipFilter = document.getElementById('chipFilter');
+  const ramFilter = document.getElementById('ramFilter');
+  const sortBy = document.getElementById('sortBy');
+  const fileInput = document.getElementById('fileInput');
+  const uploader = document.getElementById('uploader');
+  const msg = document.getElementById('message');
+  const noItems = document.getElementById('noItems');
+
+  let DATA = null;
+  let currentCountry = null;
+  let searchTerm = '';
+  let selectedChip = '';
+  let selectedRam = '';
+  let debounceTimer = null;
+
+  function setMessage(t){
+    msg.textContent = t || '';
+  }
+
+  async function attemptFetch(){
+    try {
+      const resp = await fetch('refurbs_by_country_playwright.json');
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const json = await resp.json();
+      useData(json);
+      setMessage('Loaded JSON via fetch.');
+      uploader.style.display='none';
+    } catch (err) {
+      console.warn('fetch failed:', err);
+      setMessage('Could not fetch JSON automatically. Use the file picker below or run a local HTTP server.');
+      uploader.style.display='block';
+    }
+  }
+
+  function useData(json){
+    DATA = json;
+    const countries = Object.keys(DATA).sort();
+    countrySelect.innerHTML = countries.map(c => `<option value="${c}">${c} (${DATA[c]?.length||0})</option>`).join('');
+    currentCountry = countries[0];
+    countrySelect.value = currentCountry;
+    populateFilters();
+    render();
+  }
+
+  function populateFilters(){
+    // gather unique chips and rams across selected country
+    const all = [].concat(...Object.values(DATA || {}));
+    const chips = new Set();
+    const rams = new Set();
+    all.forEach(i=>{
+      if (i && i.chip) chips.add(String(i.chip).trim());
+      if (i && i.ram) rams.add(String(i.ram).trim());
+    });
+    const chipOpts = ['<option value="">Chip (any)</option>'].concat([...chips].sort().map(v=>`<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`)).join('');
+    const ramOpts = ['<option value="">RAM (any)</option>'].concat([...rams].sort().map(v=>`<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`)).join('');
+    chipFilter.innerHTML = chipOpts;
+    ramFilter.innerHTML = ramOpts;
+  }
+
+  function escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  function formatPrice(p, cur){
+    if (p === null || p === undefined || Number.isNaN(Number(p))) return '';
+    try {
+      // show raw with currency code
+      return Number(p).toLocaleString(undefined, {minimumFractionDigits:0, maximumFractionDigits:2}) + ' ' + (cur || '');
+    } catch(e){
+      return p + ' ' + (cur || '');
+    }
+  }
+
+  function matches(item){
+    if (!item) return false;
+    const s = searchTerm.toLowerCase();
+    if (s){
+      const hay = ((item.title||'') + ' ' + (item.chip||'') + ' ' + (item.ram||'') + ' ' + (item.storage||'') + ' ' + (item.additional_details||'')).toLowerCase();
+      if (!hay.includes(s)) return false;
+    }
+    if (selectedChip && String(item.chip||'') !== selectedChip) return false;
+    if (selectedRam && String(item.ram||'') !== selectedRam) return false;
+    return true;
+  }
+
+  function getItemsForCountry(country){
+    if (!DATA) return [];
+    const items = DATA[country] || [];
+    return items.filter(Boolean);
+  }
+
+  function render(){
+    if (!DATA){ GRID.innerHTML=''; return; }
+    const items = getItemsForCountry(currentCountry).filter(matches);
+    if (!items.length){
+      GRID.innerHTML='';
+      noItems.classList.remove('hidden');
+      return;
+    }
+    noItems.classList.add('hidden');
+    // sort
+    const sorted = items.slice();
+    const sb = sortBy.value;
+    if (sb === 'price_asc'){
+      sorted.sort((a,b)=> (Number(a.price)||Infinity) - (Number(b.price)||Infinity));
+    } else if (sb === 'price_desc'){
+      sorted.sort((a,b)=> (Number(b.price)||Infinity) - (Number(a.price)||Infinity));
+    } else if (sb === 'title'){
+      sorted.sort((a,b)=> String(a.title||'').localeCompare(String(b.title||'')));
+    }
+    GRID.innerHTML = sorted.map(p => {
+      const title = escapeHtml(p.title || '—');
+      const img = p.image ? `<img loading="lazy" src="${escapeHtml(p.image)}" alt="${title}">` : `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#9ca3af">No image</div>`;
+      const meta = [p.chip, p.ram, p.storage].filter(Boolean).join(' · ');
+      const price = formatPrice(p.price, p.currency);
+      const url = p.source_url ? `<a class="source" href="${escapeHtml(p.source_url)}" target="_blank" rel="noopener">View on store</a>` : '';
+      return `
+        <article class="card" role="article">
+          <div class="thumb">${img}</div>
+          <div>
+            <div class="title">${title}</div>
+            <div class="meta left-meta">${meta ? `<div>${escapeHtml(meta)}</div>`: ''} <div class="price">${escapeHtml(price)}</div></div>
+            <div class="small" style="margin-top:6px">${escapeHtml((p.additional_details||'')).slice(0,200)}${(p.additional_details||'').length>200 ? '…':''}</div>
+            <div style="margin-top:8px">${url}</div>
+          </div>
+        </article>
+      `;
+    }).join('');
+  }
+
+  // events
+  countrySelect.addEventListener('change', e=>{
+    currentCountry = e.target.value;
+    render();
+  });
+  chipFilter.addEventListener('change', e=>{
+    selectedChip = e.target.value;
+    render();
+  });
+  ramFilter.addEventListener('change', e=>{
+    selectedRam = e.target.value;
+    render();
+  });
+  sortBy.addEventListener('change', render);
+
+  searchInput.addEventListener('input', e=>{
+    searchTerm = e.target.value.trim();
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(render, 220);
+  });
+
+  fileInput.addEventListener('change', e=>{
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = function(ev){
+      try {
+        const json = JSON.parse(ev.target.result);
+        useData(json);
+        setMessage('Loaded JSON from file input.');
+        uploader.style.display='none';
+      } catch(err){
+        setMessage('Error parsing JSON: ' + err.message);
+      }
+    };
+    r.readAsText(f, 'utf-8');
+  });
+
+  // Try fetch; if fetch fails (for file://), reveal uploader.
+  attemptFetch();
+
+  // expose for debugging in console
+  window.__REFURBS = { useData, render, DATA: () => DATA };
+})();
+</script>
+</body>
+</html>
