@@ -4,8 +4,8 @@ apple_refurbs_playwright.py
 
 Improved Playwright crawler for Apple refurbished storefronts.
 - Better multilingual support for specs extraction
-- Improved chip detection
-- Added product category detection
+- Improved chip detection with deduplication and validation
+- Enhanced RAM detection for multiple languages
 - More robust parsing logic
 """
 
@@ -17,6 +17,7 @@ import random
 import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+from typing import Set, List, Tuple, Optional, Dict
 
 from bs4 import BeautifulSoup
 from html import unescape
@@ -27,14 +28,14 @@ from asyncio import Semaphore
 DEFAULT_COUNTRY_START_URLS = {
     "US": "https://www.apple.com/shop/refurbished",
     "CA": "https://www.apple.com/ca/shop/refurbished",
-    "MX": "https://www.apple.com/mx/shop/refurbished",
     "GB": "https://www.apple.com/uk/shop/refurbished",
     "DE": "https://www.apple.com/de/shop/refurbished",
     "FR": "https://www.apple.com/fr/shop/refurbished",
-    "ES": "https://www.apple.com/es/shop/refurbished",
-    "IT": "https://www.apple.com/it/shop/refurbished",
-    "NL": "https://www.apple.com/nl/shop/refurbished",
+    # "ES": "https://www.apple.com/es/shop/refurbished",
+    # "IT": "https://www.apple.com/it/shop/refurbished",
+    # "NL": "https://www.apple.com/nl/shop/refurbished",
     "SE": "https://www.apple.com/se/shop/refurbished",
+    "CHDE": "https://www.apple.com/chde/shop/refurbished"
 }
 
 RANDOM_DELAY = (0.2, 1.0)
@@ -45,6 +46,130 @@ CONCURRENT_PRODUCT_FETCHES = 6
 DEFAULT_MAX_PAGES_PER_COUNTRY = 200
 DEFAULT_MAX_PRODUCTS_PER_COUNTRY = 1000
 MAX_BFS_DEPTH = 3
+
+
+class AppleSpecDetector:
+    """Enhanced Apple CPU and RAM detection with multilingual support and deduplication"""
+    
+    def __init__(self):
+        # Valid Apple CPUs with their canonical names (no A26, A28 etc.)
+        self.valid_cpus = {
+            # A-series (iPhone/iPad)
+            'A4', 'A5', 'A6', 'A7', 'A8', 'A9', 'A10', 'A10X', 
+            'A11', 'A12', 'A12X', 'A12Z', 'A13', 'A14', 'A15', 
+            'A16', 'A17', 'A17 Pro', 'A18', 'A18 Pro',
+            
+            # M-series (Mac)
+            'M1', 'M1 Pro', 'M1 Max', 'M1 Ultra',
+            'M2', 'M2 Pro', 'M2 Max', 'M2 Ultra', 
+            'M3', 'M3 Pro', 'M3 Max', 'M3 Ultra',
+            'M4', 'M4 Pro', 'M4 Max', 'M4 Ultra',
+            
+            # S-series (Watch) - SiP (System in Package)
+            'S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S8', 'S9', 'S10'
+        }
+        
+        self.cpu_patterns = self._create_cpu_patterns()
+        
+    def _create_cpu_patterns(self) -> List[Tuple[re.Pattern, str]]:
+        """Create regex patterns to match and normalize CPU names"""
+        patterns = []
+        
+        for cpu in self.valid_cpus:
+            # Create patterns for different formats
+            pattern_variations = [
+                # "Apple M4 Chip", "Apple M4 chip", "AppleÂ M4Â Chip"
+                rf'Apple\s*(?:Â\s*)?{re.escape(cpu)}\s*(?:Â\s*)?\s*[Cc]hip',
+                # "M4 Chip", "M4 chip"  
+                rf'\b{re.escape(cpu)}\s+[Cc]hip\b',
+                # Just "M4", "A17", etc. with word boundaries
+                rf'\b{re.escape(cpu)}\b(?!\s*[Cc]hip)',
+            ]
+            
+            # Special handling for SiP (System in Package)
+            if cpu.startswith('S') and cpu[1:].isdigit():
+                pattern_variations.extend([
+                    rf'\b{re.escape(cpu)}\s+SiP\b',
+                    rf'\b{re.escape(cpu)}\s+SIP\b',
+                ])
+            
+            # Special handling for Bionic
+            if cpu.startswith('A') and len(cpu.replace(' Pro', '')) <= 3:
+                pattern_variations.append(rf'\b{re.escape(cpu)}\s+Bionic\b')
+            
+            for pattern_str in pattern_variations:
+                pattern = re.compile(pattern_str, re.IGNORECASE)
+                patterns.append((pattern, cpu))
+                
+        return patterns
+    
+    def detect_cpus(self, text: str) -> Set[str]:
+        """Detect and normalize CPU names from text"""
+        if not text:
+            return set()
+            
+        detected_cpus = set()
+        
+        for pattern, canonical_name in self.cpu_patterns:
+            if pattern.search(text):
+                detected_cpus.add(canonical_name)
+                
+        return detected_cpus
+    
+    def detect_ram(self, text: str) -> Set[str]:
+        """Detect RAM specifications from multilingual text"""
+        if not text:
+            return set()
+            
+        # Handle special characters and normalize
+        normalized_text = text.replace('\xa0', ' ').replace('Â', ' ')
+        
+        ram_patterns = [
+            # English patterns
+            r'(\d+)\s*GB\s+(?:unified\s+)?memory\b',
+            r'(\d+)\s*GB\s+(?:of\s+)?(?:unified\s+)?memory\b',
+            r'(\d+)\s*GB\s+RAM\b',
+            r'(\d+)\s*GB\s+(?:of\s+)?RAM\b',
+            
+            # German patterns (like your sample)
+            r'(\d+)\s*GB\s+gemeinsamer\s+Arbeitsspeicher\b',
+            r'(\d+)\s*GB\s+Arbeitsspeicher\b',
+            
+            # French patterns
+            r'(\d+)\s*Go\s+de\s+mémoire\s+unifiée\b',
+            r'(\d+)\s*Go\s+de\s+mémoire\b',
+            
+            # Spanish patterns
+            r'(\d+)\s*GB\s+de\s+memoria\s+unificada\b',
+            r'(\d+)\s*GB\s+de\s+memoria\b',
+            
+            # Italian patterns
+            r'(\d+)\s*GB\s+di\s+memoria\s+unificata\b',
+            r'(\d+)\s*GB\s+di\s+memoria\b',
+            
+            # Dutch patterns
+            r'(\d+)\s*GB\s+(?:gedeeld\s+)?geheugen\b',
+            
+            # General memory patterns
+            r'memory[:\s]*(\d+)\s*GB\b',
+            r'RAM[:\s]*(\d+)\s*GB\b',
+        ]
+        
+        detected_ram = set()
+        
+        for pattern in ram_patterns:
+            matches = re.finditer(pattern, normalized_text, re.IGNORECASE)
+            for match in matches:
+                gb_value = int(match.group(1))
+                # Only accept realistic RAM values (4GB to 192GB for Apple devices)
+                if 4 <= gb_value <= 192:
+                    detected_ram.add(f"{gb_value}GB")
+                    
+        return detected_ram
+
+
+# Global detector instance
+spec_detector = AppleSpecDetector()
 
 
 # ---------- Parsing helpers ----------
@@ -139,7 +264,8 @@ def extract_details_text(html):
     texts = []
     selectors = [
         ".as-productinfo", ".product-hero", ".tech-specs", ".rb-content", ".product-hero__description",
-        ".section-copy", "#overview", ".description"
+        ".section-copy", "#overview", ".description", ".rf-configuration-subheader",
+        ".rf-configuration-productsummary"
     ]
     for sel in selectors:
         node = soup.select_one(sel)
@@ -153,9 +279,7 @@ def extract_details_text(html):
 
 
 def detect_product_category(title: str, url: str = None) -> str:
-    """
-    Detect product category from title and URL.
-    """
+    """Detect product category from title and URL."""
     if not title:
         return "Other"
     
@@ -222,118 +346,88 @@ def detect_product_category(title: str, url: str = None) -> str:
     return "Other"
 
 
+def detect_storage(text: str) -> Optional[str]:
+    """Detect storage from multilingual text"""
+    if not text:
+        return None
+        
+    # Normalize text
+    normalized_text = text.replace('\xa0', ' ').replace('Â', ' ')
+    
+    storage_patterns = [
+        # English
+        r'(\d{1,4})\s*([GT])B\s+(?:of\s+)?(?:SSD|storage|Storage)\b',
+        r'(?:SSD|storage|Storage)[\s:]+(\d{1,4})\s*([GT])B\b',
+        
+        # German (like your sample: "512 GB SSD Speicher")
+        r'(\d{1,4})\s*([GT])B\s+SSD\s+Speicher\b',
+        r'(\d{1,4})\s*([GT])B\s+Speicher\b',
+        
+        # French
+        r'(\d{1,4})\s*([GT])o\s+(?:de\s+)?(?:SSD|stockage)\b',
+        r'(?:SSD|stockage)[\s:]+(?:de\s+)?(\d{1,4})\s*([GT])o\b',
+        
+        # Spanish
+        r'(\d{1,4})\s*([GT])B\s+(?:de\s+)?(?:SSD|almacenamiento)\b',
+        
+        # Italian
+        r'(\d{1,4})\s*([GT])B\s+(?:di\s+)?(?:SSD|archiviazione)\b',
+        
+        # General pattern for large standalone numbers (likely storage)
+        r'\b(\d{3,4})\s*([GT])B\b(?!\s*(?:memory|Memory|RAM|mémoire|memoria|Arbeitsspeicher))',
+    ]
+    
+    for pattern in storage_patterns:
+        match = re.search(pattern, normalized_text, re.IGNORECASE)
+        if match:
+            size_num = int(match.group(1))
+            unit = match.group(2).upper()
+            
+            # Filter out unrealistic values
+            if unit == 'G' and size_num >= 128:  # Minimum 128GB
+                return f"{size_num}GB"
+            elif unit == 'T' and 1 <= size_num <= 8:  # 1-8TB range
+                return f"{size_num}TB"
+                
+    return None
+
+
 def find_ram_storage_chip(text: str, title: str = None):
-    """
-    Improved detection for RAM, storage, and chip from multilingual product descriptions.
-    """
+    """Improved detection using the new spec detector"""
     res = {'ram': None, 'storage': None, 'chip': None}
     if not text:
         return res
 
-    # Normalize text: handle French "Go", non-breaking spaces, and special chars
-    t = text.replace('\xa0', ' ').replace('Go ', 'GB ').replace('Go\n', 'GB\n').replace('Go.', 'GB.')
-    t = t.replace('To ', 'TB ').replace('To\n', 'TB\n').replace('To.', 'TB.')
+    # Combine title and text for better detection
+    combined_text = (title or '') + " " + text
     
-    # Also check title for specs
-    if title:
-        t = title + " " + t
+    # Use the improved spec detector
+    detected_cpus = spec_detector.detect_cpus(combined_text)
+    detected_ram = spec_detector.detect_ram(combined_text)
     
-    # ----- Enhanced Chip detection (do this first) -----
-    # Apple Silicon chips (M-series)
-    chip_patterns = [
-        r'(?:Apple\s+)?M4\s*(?:Pro|Max|Ultra)?\s*(?:chip|Chip)?',
-        r'(?:Apple\s+)?M3\s*(?:Pro|Max|Ultra)?\s*(?:chip|Chip)?',
-        r'(?:Apple\s+)?M2\s*(?:Pro|Max|Ultra)?\s*(?:chip|Chip)?',
-        r'(?:Apple\s+)?M1\s*(?:Pro|Max|Ultra)?\s*(?:chip|Chip)?',
-        r'(?:puce|chip|Chip)\s+(?:Apple\s+)?M\d+\s*(?:Pro|Max|Ultra)?',  # French: "puce M3"
-        r'A\d{1,2}X?\s*(?:Bionic|Pro)?',  # A-series chips
-        r'S\d+\s*(?:SiP)?',  # Watch chips
-    ]
+    # Take the first/best CPU and RAM
+    if detected_cpus:
+        # Prefer M-series over others, then by recency
+        cpu_list = sorted(detected_cpus, key=lambda x: (
+            0 if x.startswith('M4') else
+            1 if x.startswith('M3') else
+            2 if x.startswith('M2') else
+            3 if x.startswith('M1') else
+            4 if x.startswith('A') else 5
+        ))
+        res['chip'] = cpu_list[0]
     
-    for pattern in chip_patterns:
-        chip_match = re.search(pattern, t, flags=re.IGNORECASE)
-        if chip_match:
-            chip_text = chip_match.group(0).strip()
-            # Normalize chip name
-            chip_text = re.sub(r'\s+', ' ', chip_text)
-            chip_text = re.sub(r'(?i)(puce|chip)\s+', '', chip_text).strip()
-            if not re.match(r'^(Apple\s+)?M\d+', chip_text, re.IGNORECASE):
-                chip_text = chip_text.replace('apple ', 'Apple ', 1)
-            res['chip'] = chip_text
-            break
+    if detected_ram:
+        # Take the largest RAM size if multiple found
+        ram_list = sorted(detected_ram, key=lambda x: int(x.replace('GB', '')), reverse=True)
+        res['ram'] = ram_list[0]
     
-    # ----- Enhanced RAM detection -----
-    # Multilingual RAM keywords
-    ram_keywords = [
-        r'(\d{1,3})\s?(?:GB|TB)\s+(?:of\s+)?(?:unified\s+)?(?:memory|Memory|RAM|mémoire\s+unifiée|memoria\s+unificada|Arbeitsspeicher|memoria)',
-        r'(\d{1,3})\s?(?:GB|TB)\s+(?:de\s+)?(?:mémoire|memoria|Speicher)',
-        r'(?:unified\s+)?(?:memory|Memory|RAM|mémoire|memoria)[\s:]+(\d{1,3})\s?(?:GB|TB)',
-        r'(\d{1,3})\s?(?:Go|GB|TB)\s+(?:de\s+)?(?:RAM|mémoire\s+vive)',
-    ]
+    # Use separate storage detection
+    storage = detect_storage(combined_text)
+    if storage:
+        res['storage'] = storage
     
-    for pattern in ram_keywords:
-        ram_match = re.search(pattern, t, flags=re.IGNORECASE)
-        if ram_match:
-            # Extract the numeric group
-            for group in ram_match.groups():
-                if group and re.match(r'\d+', group):
-                    res['ram'] = group.upper() + 'GB'
-                    break
-            if res['ram']:
-                break
-    
-    # ----- Enhanced Storage detection -----
-    # Multilingual storage keywords
-    storage_keywords = [
-        r'(\d{1,4})\s?(?:GB|TB)\s+(?:of\s+)?(?:SSD|storage|Storage|stockage|almacenamiento|Speicherplatz|archiviazione)',
-        r'SSD[\s:]+(?:de\s+)?(\d{1,4})\s?(?:GB|TB)',
-        r'(?:SSD|storage|stockage|almacenamiento)[\s:]+(\d{1,4})\s?(?:GB|TB)',
-        r'(\d{1,4})\s?(?:Go|GB|TB)\s+(?:de\s+)?(?:SSD|stockage|disque)',
-        r'(\d{3,4})\s?(?:GB|TB)(?:\s|$)',  # Standalone large numbers likely storage
-    ]
-    
-    for pattern in storage_keywords:
-        storage_match = re.search(pattern, t, flags=re.IGNORECASE)
-        if storage_match:
-            # Extract the numeric group
-            for group in storage_match.groups():
-                if group and re.match(r'\d+', group):
-                    # Convert to standard format
-                    num = int(group)
-                    if num >= 128:  # Storage usually 128GB or more
-                        if num >= 1000:
-                            res['storage'] = f"{num//1000}TB"
-                        else:
-                            res['storage'] = f"{num}GB"
-                        break
-            if res['storage']:
-                break
-    
-    # ----- Fallback: Look for patterns like "16GB 512GB" -----
-    if not res['ram'] or not res['storage']:
-        # Find all memory/storage sizes
-        sizes = re.findall(r'(\d{1,4})\s?(?:GB|TB|Go|To)', t, flags=re.IGNORECASE)
-        if sizes:
-            sizes_int = []
-            for s in sizes:
-                try:
-                    sizes_int.append(int(s))
-                except:
-                    pass
-            
-            # Sort to identify likely RAM vs storage
-            sizes_int.sort()
-            
-            for size in sizes_int:
-                if not res['ram'] and size <= 64:  # RAM typically <= 64GB
-                    res['ram'] = f"{size}GB"
-                elif not res['storage'] and size >= 128:  # Storage typically >= 128GB
-                    if size >= 1000:
-                        res['storage'] = f"{size//1000}TB"
-                    else:
-                        res['storage'] = f"{size}GB"
-    
-    # Special case: Apple Pencil and similar accessories shouldn't have chip info
+    # Special case: Accessories shouldn't have chip info
     if title and any(x in title.lower() for x in ['pencil', 'keyboard', 'mouse', 'cable', 'adapter']):
         res['chip'] = None
     
@@ -341,9 +435,7 @@ def find_ram_storage_chip(text: str, title: str = None):
 
 
 def parse_product_page_html(html, source_url=None):
-    """
-    Parse fields and return dict including 'is_product' boolean and category.
-    """
+    """Parse fields and return dict including 'is_product' boolean and category."""
     blocks = extract_ld_json(html)
     prod_block = find_product_block(blocks)
     title = None
@@ -403,7 +495,7 @@ def parse_product_page_html(html, source_url=None):
             is_product = True
     
     # Don't treat error pages as products
-    if title and any(x in title.lower() for x in ['page not found', 'page introuvable', 'no se encuentra']):
+    if title and any(x in title.lower() for x in ['page not found', 'page introuvable', 'no se encuentra', 'nicht gefunden']):
         is_product = False
 
     parsed = {
@@ -424,10 +516,7 @@ def parse_product_page_html(html, source_url=None):
 
 # ---------- Link discovery & heuristics ----------
 def looks_like_product_url(url: str) -> bool:
-    """
-    Strong product URL heuristics: canonical /shop/product/ or product-id segments.
-    Conservative to avoid false positives.
-    """
+    """Strong product URL heuristics: canonical /shop/product/ or product-id segments."""
     if re.search(r'/shop/product/', url, flags=re.IGNORECASE):
         return True
     if re.search(r'/product/|/product-page|/A/[A-Z0-9]{5,}', url, flags=re.IGNORECASE):
@@ -439,9 +528,7 @@ def looks_like_product_url(url: str) -> bool:
 
 
 async def discover_links_on_page(page, base_url):
-    """
-    Return same-origin normalized links found on the page.
-    """
+    """Return same-origin normalized links found on the page."""
     urls = set()
     anchors = await page.query_selector_all("a[href]")
     for a in anchors:
@@ -470,10 +557,7 @@ async def discover_links_on_page(page, base_url):
 
 # ---------- Validate & parse (single fetch) ----------
 async def fetch_and_validate_parse(semaphore: Semaphore, browser, url: str, verbose=False):
-    """
-    Fetch the candidate URL, parse and validate it.
-    Ensures source_url is canonical if provided and canonical looks product-like.
-    """
+    """Fetch the candidate URL, parse and validate it."""
     async with semaphore:
         context = await browser.new_context(user_agent="Mozilla/5.0 (compatible; RefurbCrawler/1.0)")
         page = await context.new_page()
@@ -627,7 +711,6 @@ async def crawl_country_bfs(country_tag, start_url, browser, max_per_country=0, 
 
             # Only treat this visited URL as a candidate product if the URL (or canonical) is product-like.
             if url_is_product_like or canonical_is_product_like:
-                # We have the page HTML already — parse it immediately to avoid double-fetch.
                 validate_source = canonical if canonical_is_product_like else url
                 parsed = parse_product_page_html(html, source_url=validate_source)
                 if parsed.get("is_product"):
@@ -705,12 +788,20 @@ async def crawl_country_bfs(country_tag, start_url, browser, max_per_country=0, 
             except Exception:
                 pass
 
-    # Filter out error pages
+    # Filter out error pages and deduplicate
     results = [r for r in results if r.get('title') and 
-               not any(x in r['title'].lower() for x in ['page not found', 'page introuvable', 'no se encuentra'])]
+               not any(x in r['title'].lower() for x in ['page not found', 'page introuvable', 'no se encuentra', 'nicht gefunden'])]
+    
+    # Remove duplicates based on source_url
+    seen_urls = set()
+    unique_results = []
+    for result in results:
+        if result['source_url'] not in seen_urls:
+            seen_urls.add(result['source_url'])
+            unique_results.append(result)
 
-    print(f"[+] {country_tag}: parsed {len(results)} products (pages visited: {pages_visited})")
-    return results
+    print(f"[+] {country_tag}: parsed {len(unique_results)} unique products (pages visited: {pages_visited})")
+    return unique_results
 
 
 # ---------- CLI & main ----------
@@ -747,15 +838,46 @@ async def main_async(args):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=not args.show_browser)
         out = {}
+        
+        # Summary stats for debugging
+        total_products = 0
+        cpu_stats = {}
+        ram_stats = {}
+        
         for tag, url in start_map.items():
             prods = await crawl_country_bfs(tag, url, browser, max_per_country=(args.max_per_country or 0),
                                             max_pages=(args.max_pages or 0), verbose=args.verbose)
             out[tag] = prods
+            total_products += len(prods)
+            
+            # Collect stats for debugging
+            for prod in prods:
+                if prod.get('chip'):
+                    cpu_stats[prod['chip']] = cpu_stats.get(prod['chip'], 0) + 1
+                if prod.get('ram'):
+                    ram_stats[prod['ram']] = ram_stats.get(prod['ram'], 0) + 1
+                    
             time.sleep(random.uniform(*RANDOM_DELAY))
 
         out_path = Path(args.output)
         out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-        print("Saved:", out_path.resolve())
+        
+        print(f"\n[SUMMARY]")
+        print(f"Total products: {total_products}")
+        print(f"Unique CPUs found: {len(cpu_stats)}")
+        print(f"Unique RAM configs: {len(ram_stats)}")
+        
+        if args.verbose and cpu_stats:
+            print(f"\nCPU distribution:")
+            for cpu, count in sorted(cpu_stats.items(), key=lambda x: x[1], reverse=True)[:10]:
+                print(f"  {cpu}: {count}")
+                
+        if args.verbose and ram_stats:
+            print(f"\nRAM distribution:")
+            for ram, count in sorted(ram_stats.items(), key=lambda x: int(x[0].replace('GB', '')))[:10]:
+                print(f"  {ram}: {count}")
+        
+        print(f"\nSaved: {out_path.resolve()}")
         await browser.close()
 
 
