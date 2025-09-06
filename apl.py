@@ -286,11 +286,11 @@ def detect_product_category(title: str, url: str = None) -> str:
     t = title.lower()
     u = (url or "").lower()
     
-    # Desktop computers
-    if any(x in t for x in ['imac', 'mac mini', 'mac studio', 'mac pro']):
+    # Desktop computers - check specific models first to avoid conflicts
+    if any(x in t for x in ['mac mini', 'mac studio', 'mac pro', 'imac']):
         return "Desktop"
     
-    # Laptops
+    # Laptops - check after desktop to avoid "mac" conflicts
     if any(x in t for x in ['macbook', 'mac book']):
         return "Laptop"
     
