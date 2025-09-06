@@ -2,11 +2,11 @@
 """
 apple_refurbs_playwright.py
 
-Playwright crawler for Apple refurbished storefronts.
-Avoids false positives by only accepting concrete product pages.
-- BFS across category pages (seeded from /shop/refurbished)
-- Accepts a product only if URL is strongly product-like or canonical indicates product
-- source_url in output is the concrete product URL (canonical if present)
+Improved Playwright crawler for Apple refurbished storefronts.
+- Better multilingual support for specs extraction
+- Improved chip detection
+- Added product category detection
+- More robust parsing logic
 """
 
 import asyncio
@@ -152,55 +152,197 @@ def extract_details_text(html):
     return "\n".join(texts).strip()
 
 
-def find_ram_storage_chip(text: str):
+def detect_product_category(title: str, url: str = None) -> str:
     """
-    Detect RAM, storage, and chip name from multilingual product descriptions.
-    Supports EN, FR, DE, ES, IT.
+    Detect product category from title and URL.
+    """
+    if not title:
+        return "Other"
+    
+    t = title.lower()
+    u = (url or "").lower()
+    
+    # Desktop computers
+    if any(x in t for x in ['imac', 'mac mini', 'mac studio', 'mac pro']):
+        return "Desktop"
+    
+    # Laptops
+    if any(x in t for x in ['macbook', 'mac book']):
+        return "Laptop"
+    
+    # iPads
+    if 'ipad' in t:
+        return "iPad"
+    
+    # iPhones
+    if 'iphone' in t:
+        return "iPhone"
+    
+    # Apple Watch
+    if any(x in t for x in ['watch', 'apple watch']):
+        return "Watch"
+    
+    # Apple TV
+    if 'apple tv' in t or 'appletv' in t:
+        return "Apple TV"
+    
+    # HomePod
+    if 'homepod' in t:
+        return "HomePod"
+    
+    # AirPods
+    if 'airpod' in t:
+        return "AirPods"
+    
+    # Accessories
+    if any(x in t for x in ['pencil', 'keyboard', 'mouse', 'trackpad', 'cable', 'adapter', 
+                            'magsafe', 'power', 'case', 'band', 'strap', 'studio display']):
+        return "Accessory"
+    
+    # Check URL patterns as fallback
+    if u:
+        if '/mac/' in u or '/macbook' in u:
+            if 'book' in u:
+                return "Laptop"
+            else:
+                return "Desktop"
+        if '/ipad' in u:
+            return "iPad"
+        if '/iphone' in u:
+            return "iPhone"
+        if '/watch' in u:
+            return "Watch"
+        if '/tv' in u:
+            return "Apple TV"
+        if '/airpods' in u:
+            return "AirPods"
+        if '/homepod' in u:
+            return "HomePod"
+    
+    return "Other"
+
+
+def find_ram_storage_chip(text: str, title: str = None):
+    """
+    Improved detection for RAM, storage, and chip from multilingual product descriptions.
     """
     res = {'ram': None, 'storage': None, 'chip': None}
     if not text:
         return res
 
-    t = text.replace('\xa0', ' ').replace('Go', 'GB')  # normalize NBSP + French Go
-
-    # ----- Keyword dictionaries -----
-    ram_keywords = r'(RAM|Arbeitsspeicher|mémoire|memoria|memory)'
-    storage_keywords = r'(SSD|storage|stockage|Speicher|archiviazione|almacenamiento|drive)'
-
-    # ----- RAM -----
-    ram_match = re.search(r'(\d{1,4}\s?(?:GB|TB)).{0,20}' + ram_keywords, t, flags=re.IGNORECASE)
-    if ram_match:
-        res['ram'] = ram_match.group(1).upper().replace(' ', '')
-
-    # ----- Storage -----
-    storage_match = re.search(r'(\d{1,4}\s?(?:GB|TB)).{0,20}' + storage_keywords, t, flags=re.IGNORECASE)
-    if storage_match:
-        res['storage'] = storage_match.group(1).upper().replace(' ', '')
-
-    # ----- Fallback: assign by order if only plain sizes -----
+    # Normalize text: handle French "Go", non-breaking spaces, and special chars
+    t = text.replace('\xa0', ' ').replace('Go ', 'GB ').replace('Go\n', 'GB\n').replace('Go.', 'GB.')
+    t = t.replace('To ', 'TB ').replace('To\n', 'TB\n').replace('To.', 'TB.')
+    
+    # Also check title for specs
+    if title:
+        t = title + " " + t
+    
+    # ----- Enhanced Chip detection (do this first) -----
+    # Apple Silicon chips (M-series)
+    chip_patterns = [
+        r'(?:Apple\s+)?M4\s*(?:Pro|Max|Ultra)?\s*(?:chip|Chip)?',
+        r'(?:Apple\s+)?M3\s*(?:Pro|Max|Ultra)?\s*(?:chip|Chip)?',
+        r'(?:Apple\s+)?M2\s*(?:Pro|Max|Ultra)?\s*(?:chip|Chip)?',
+        r'(?:Apple\s+)?M1\s*(?:Pro|Max|Ultra)?\s*(?:chip|Chip)?',
+        r'(?:puce|chip|Chip)\s+(?:Apple\s+)?M\d+\s*(?:Pro|Max|Ultra)?',  # French: "puce M3"
+        r'A\d{1,2}X?\s*(?:Bionic|Pro)?',  # A-series chips
+        r'S\d+\s*(?:SiP)?',  # Watch chips
+    ]
+    
+    for pattern in chip_patterns:
+        chip_match = re.search(pattern, t, flags=re.IGNORECASE)
+        if chip_match:
+            chip_text = chip_match.group(0).strip()
+            # Normalize chip name
+            chip_text = re.sub(r'\s+', ' ', chip_text)
+            chip_text = re.sub(r'(?i)(puce|chip)\s+', '', chip_text).strip()
+            if not re.match(r'^(Apple\s+)?M\d+', chip_text, re.IGNORECASE):
+                chip_text = chip_text.replace('apple ', 'Apple ', 1)
+            res['chip'] = chip_text
+            break
+    
+    # ----- Enhanced RAM detection -----
+    # Multilingual RAM keywords
+    ram_keywords = [
+        r'(\d{1,3})\s?(?:GB|TB)\s+(?:of\s+)?(?:unified\s+)?(?:memory|Memory|RAM|mémoire\s+unifiée|memoria\s+unificada|Arbeitsspeicher|memoria)',
+        r'(\d{1,3})\s?(?:GB|TB)\s+(?:de\s+)?(?:mémoire|memoria|Speicher)',
+        r'(?:unified\s+)?(?:memory|Memory|RAM|mémoire|memoria)[\s:]+(\d{1,3})\s?(?:GB|TB)',
+        r'(\d{1,3})\s?(?:Go|GB|TB)\s+(?:de\s+)?(?:RAM|mémoire\s+vive)',
+    ]
+    
+    for pattern in ram_keywords:
+        ram_match = re.search(pattern, t, flags=re.IGNORECASE)
+        if ram_match:
+            # Extract the numeric group
+            for group in ram_match.groups():
+                if group and re.match(r'\d+', group):
+                    res['ram'] = group.upper() + 'GB'
+                    break
+            if res['ram']:
+                break
+    
+    # ----- Enhanced Storage detection -----
+    # Multilingual storage keywords
+    storage_keywords = [
+        r'(\d{1,4})\s?(?:GB|TB)\s+(?:of\s+)?(?:SSD|storage|Storage|stockage|almacenamiento|Speicherplatz|archiviazione)',
+        r'SSD[\s:]+(?:de\s+)?(\d{1,4})\s?(?:GB|TB)',
+        r'(?:SSD|storage|stockage|almacenamiento)[\s:]+(\d{1,4})\s?(?:GB|TB)',
+        r'(\d{1,4})\s?(?:Go|GB|TB)\s+(?:de\s+)?(?:SSD|stockage|disque)',
+        r'(\d{3,4})\s?(?:GB|TB)(?:\s|$)',  # Standalone large numbers likely storage
+    ]
+    
+    for pattern in storage_keywords:
+        storage_match = re.search(pattern, t, flags=re.IGNORECASE)
+        if storage_match:
+            # Extract the numeric group
+            for group in storage_match.groups():
+                if group and re.match(r'\d+', group):
+                    # Convert to standard format
+                    num = int(group)
+                    if num >= 128:  # Storage usually 128GB or more
+                        if num >= 1000:
+                            res['storage'] = f"{num//1000}TB"
+                        else:
+                            res['storage'] = f"{num}GB"
+                        break
+            if res['storage']:
+                break
+    
+    # ----- Fallback: Look for patterns like "16GB 512GB" -----
     if not res['ram'] or not res['storage']:
-        sizes = re.findall(r'(\d{1,4}\s?(?:GB|TB))', t, flags=re.IGNORECASE)
+        # Find all memory/storage sizes
+        sizes = re.findall(r'(\d{1,4})\s?(?:GB|TB|Go|To)', t, flags=re.IGNORECASE)
         if sizes:
-            if not res['ram']:
-                res['ram'] = sizes[0].upper().replace(' ', '')
-            if not res['storage'] and len(sizes) >= 2:
-                res['storage'] = sizes[1].upper().replace(' ', '')
-
-    # ----- Chip detection -----
-    chip_match = re.search(
-        r'(A\d+\s*Bionic|S\d+\s*SiP|Apple\s+M\d+\s*Chip?|M\d+(?:\s*(?:Pro|Max|Ultra))?)',
-        t, flags=re.IGNORECASE
-    )
-    if chip_match:
-        res['chip'] = chip_match.group(1).strip()
-
+            sizes_int = []
+            for s in sizes:
+                try:
+                    sizes_int.append(int(s))
+                except:
+                    pass
+            
+            # Sort to identify likely RAM vs storage
+            sizes_int.sort()
+            
+            for size in sizes_int:
+                if not res['ram'] and size <= 64:  # RAM typically <= 64GB
+                    res['ram'] = f"{size}GB"
+                elif not res['storage'] and size >= 128:  # Storage typically >= 128GB
+                    if size >= 1000:
+                        res['storage'] = f"{size//1000}TB"
+                    else:
+                        res['storage'] = f"{size}GB"
+    
+    # Special case: Apple Pencil and similar accessories shouldn't have chip info
+    if title and any(x in title.lower() for x in ['pencil', 'keyboard', 'mouse', 'cable', 'adapter']):
+        res['chip'] = None
+    
     return res
-
 
 
 def parse_product_page_html(html, source_url=None):
     """
-    Parse fields and return dict including 'is_product' boolean.
+    Parse fields and return dict including 'is_product' boolean and category.
     """
     blocks = extract_ld_json(html)
     prod_block = find_product_block(blocks)
@@ -240,10 +382,14 @@ def parse_product_page_html(html, source_url=None):
                 except:
                     price = mcur.group(1)
 
+    # Extract specs with improved multilingual support
     longtext = (description or '') + "\n" + additional_details
-    specs = find_ram_storage_chip(longtext)
+    specs = find_ram_storage_chip(longtext, title)
+    
+    # Detect product category
+    category = detect_product_category(title, source_url)
 
-    # decide product-ness conservatively: prefer JSON-LD product OR price+image+some spec
+    # decide product-ness conservatively
     is_product = False
     if prod_block:
         is_product = True
@@ -255,9 +401,14 @@ def parse_product_page_html(html, source_url=None):
         og_type = meta_tag(html, prop='og:type')
         if og_type and 'product' in og_type.lower():
             is_product = True
+    
+    # Don't treat error pages as products
+    if title and any(x in title.lower() for x in ['page not found', 'page introuvable', 'no se encuentra']):
+        is_product = False
 
     parsed = {
         "title": (title.strip() if title else None),
+        "category": category,
         "price": price,
         "currency": currency,
         "ram": specs['ram'],
@@ -553,6 +704,10 @@ async def crawl_country_bfs(country_tag, start_url, browser, max_per_country=0, 
                         break
             except Exception:
                 pass
+
+    # Filter out error pages
+    results = [r for r in results if r.get('title') and 
+               not any(x in r['title'].lower() for x in ['page not found', 'page introuvable', 'no se encuentra'])]
 
     print(f"[+] {country_tag}: parsed {len(results)} products (pages visited: {pages_visited})")
     return results

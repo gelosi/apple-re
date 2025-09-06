@@ -189,7 +189,9 @@
           <div class="thumb">${img}</div>
           <div>
             <div class="title">${title}</div>
-            <div class="meta left-meta">${meta ? `<div>${escapeHtml(meta)}</div>`: ''} <div class="price">${escapeHtml(price)}</div></div>
+            <div class="meta left-meta">${meta ? `<div>${escapeHtml(meta)}</div>`: ''} <div class="price">${escapeHtml(price)}</div></div><div class="meta small" style="margin-top:4px">
+  <span>RAM: ${escapeHtml(String(p.ram||""))}</span>   <span>· Storage: ${escapeHtml(String(p.storage||""))}</span>
+</div>
             <div class="small" style="margin-top:6px">${escapeHtml((p.additional_details||'')).slice(0,200)}${(p.additional_details||'').length>200 ? '…':''}</div>
             <div style="margin-top:8px">${url}</div>
           </div>
