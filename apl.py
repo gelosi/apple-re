@@ -28,14 +28,15 @@ from asyncio import Semaphore
 DEFAULT_COUNTRY_START_URLS = {
     "US": "https://www.apple.com/shop/refurbished",
     "CA": "https://www.apple.com/ca/shop/refurbished",
-    "GB": "https://www.apple.com/uk/shop/refurbished",
+    # "GB": "https://www.apple.com/uk/shop/refurbished",
     "DE": "https://www.apple.com/de/shop/refurbished",
     "FR": "https://www.apple.com/fr/shop/refurbished",
     # "ES": "https://www.apple.com/es/shop/refurbished",
-    # "IT": "https://www.apple.com/it/shop/refurbished",
+    "IT": "https://www.apple.com/it/shop/refurbished",
     # "NL": "https://www.apple.com/nl/shop/refurbished",
     "SE": "https://www.apple.com/se/shop/refurbished",
-    "CHDE": "https://www.apple.com/chde/shop/refurbished"
+    "CHDE": "https://www.apple.com/chde/shop/refurbished",
+    "IE": "https://www.apple.com/ie/shop/refurbished"
 }
 
 RANDOM_DELAY = (0.2, 1.0)
